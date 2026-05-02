@@ -3,20 +3,27 @@
 .env
 .env.*
 ! .env.example
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
 
 # Python / Backend
-backend/__pycache__/
-backend/*.py[cod]
-backend/*$py.class
 backend/.venv/
 backend/venv/
 backend/env/
 backend/*.log
 
-# Node / Frontend (frontend/.gitignore already exists but adding just in case)
+# Node / Frontend
 frontend/node_modules/
 frontend/.next/
 frontend/out/
 frontend/build/
+frontend/dist/
 frontend/coverage/
 frontend/*.log
+frontend/.vercel/
+
+# Misc
+graphify-out/
+Local.txt
+

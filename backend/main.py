@@ -1,12 +1,21 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import asyncio
+from contextlib import asynccontextmanager
+import uuid
+import json
+import threading
 import logging
-from dotenv import load_dotenv
 import sys
 import os
-import asyncio
+import httpx
+import psutil
 from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from google.oauth2 import id_token
+from google.auth.transport import requests as grequests
 
 # Ensure the parent directory is in the Python path so "backend.agents" can be resolved
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,34 +23,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Load environment variables from .env file
 load_dotenv()
 
-
-app = FastAPI(title="LifeOS Agent Backend")
-
-# Setup CORS for the Next.js frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # Next.js default port
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-from fastapi.responses import StreamingResponse
-from langchain_core.messages import HumanMessage
 from backend.agents.graph import graph
-from motor.motor_asyncio import AsyncIOMotorClient
-import json
-import threading
-import asyncio
-import uuid
-from datetime import datetime, timezone
 from backend.models.user import UserProfileSchema, OnboardResponse
-from google.oauth2 import id_token
-from google.auth.transport import requests as grequests
-
-import urllib.parse
-from urllib.parse import quote_plus
-import httpx
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.server_api import ServerApi
+from langchain_core.messages import HumanMessage
 
 # MongoDB Setup
 uri = os.getenv("MONGO_URI", os.getenv("MONGODB_URL", "mongodb://localhost:27017/lifeos"))
@@ -57,14 +43,28 @@ client = AsyncIOMotorClient(
 )
 db = client.get_database("lifeos")
 
-@app.on_event("startup")
-async def startup_db_client():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     # Send a ping to confirm a successful connection
     try:
         await client.admin.command('ping')
         print("Pinged your deployment. You successfully connected to MongoDB!")
     except Exception as e:
         print(f"MongoDB connection error: {e}")
+    yield
+    # Close MongoDB connection on shutdown
+    client.close()
+
+app = FastAPI(title="LifeOS Agent Backend", lifespan=lifespan)
+
+# Setup CORS for the Next.js frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # Next.js default port
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class GoogleAuthRequest(BaseModel):
     token: str
@@ -391,25 +391,19 @@ async def focus_blocker_loop(end_time: datetime, blocked_apps: list[str]):
     try:
         while datetime.now(timezone.utc) < end_time:
             try:
-                # osascript is slower, let's just use it
-                script = 'tell application "System Events" to get name of every application process whose background only is false'
-                proc = await asyncio.create_subprocess_exec(
-                    "osascript", "-e", script,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, _ = await proc.communicate()
-                if proc.returncode == 0:
-                    running_apps = stdout.decode().strip().split(", ")
-                    for app in blocked_apps:
-                        if app in running_apps:
-                            print(f"[Focus] Quitting blocked app: {app}")
-                            quit_proc = await asyncio.create_subprocess_exec(
-                                "osascript", "-e", f'tell application "{app}" to quit'
-                            )
-                            await quit_proc.communicate()
+                # Use psutil for cross-platform process management
+                for proc in psutil.process_iter(['name']):
+                    try:
+                        proc_name = proc.info['name']
+                        if any(blocked_app.lower() in proc_name.lower() for blocked_app in blocked_apps):
+                            print(f"[Focus] Terminating blocked app: {proc_name}")
+                            proc.terminate()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        pass
             except Exception as e:
                 print(f"[Focus] Blocker loop error: {e}")
+            
+            await asyncio.sleep(3)
             
             await asyncio.sleep(3)
     except asyncio.CancelledError:
